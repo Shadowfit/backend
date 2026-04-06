@@ -1,4 +1,4 @@
-package com.shadowfit.global.etc;
+package com.shadowfit.global.util;
 
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
