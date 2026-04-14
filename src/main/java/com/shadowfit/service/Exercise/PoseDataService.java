@@ -1,9 +1,16 @@
 package com.shadowfit.service.Exercise;
 
 import com.shadowfit.dto.exercises.PoseDataRequestDto;
+import com.shadowfit.global.error.BusinessException;
+import com.shadowfit.global.error.ErrorCode;
 import com.shadowfit.grpc.PoseDataBatchRequest;
+import com.shadowfit.grpc.PoseDataRequest;
+import com.shadowfit.model.exercise.Exercise;
+import com.shadowfit.model.exercise.ExerciseReference;
 import com.shadowfit.model.exercise.PoseData;
 import com.shadowfit.model.exercise.Session;
+import com.shadowfit.repository.ExerciseReferenceRepository;
+import com.shadowfit.repository.ExercisesRepository;
 import com.shadowfit.repository.PoseDataRepository;
 import com.shadowfit.repository.SessionRepository;
 import lombok.RequiredArgsConstructor;
@@ -19,6 +26,8 @@ import java.util.stream.Collectors;
 public class PoseDataService {
     private final PoseDataRepository poseDataRepository;
     private final SessionRepository sessionRepository;
+    private final ExercisesRepository exercisesRepository;
+    private final ExerciseReferenceRepository referenceRepository;
 
     @Transactional
     public void savePoseDataBatch(List<PoseDataRequestDto> dtos) {
@@ -40,6 +49,28 @@ public class PoseDataService {
 
         // 3. 배치 저장 실행
         poseDataRepository.saveAll(entities);
+    }
+
+    @Transactional
+    public void saveReferencePoses(Long exerciseId, List<PoseDataRequest> poseDataList) {
+        // 1. 해당 운동이 존재하는지 확인
+        Exercise exercise = exercisesRepository.findById(exerciseId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.EXERCISE_NOT_FOUND));
+
+        // 2. 기존에 저장된 기준 좌표가 있다면 삭제 (선택 사항: 업데이트 개념이라면 삭제 후 재입력)
+        // referenceRepository.deleteByExercise(exercise);
+
+        // 3. Proto 메시지 리스트 -> ExerciseReference 엔티티 리스트 변환
+        List<ExerciseReference> entities = poseDataList.stream()
+                .map(p -> ExerciseReference.builder()
+                        .exercise(exercise)
+                        .timestampSec(p.getTimestampSec())
+                        .jointCoordinates(p.getJointCoordinates())
+                        .build())
+                .collect(Collectors.toList());
+
+        // 4. 저장 (referenceRepository는 ExerciseReferenceRepository 주입 필요)
+        referenceRepository.saveAll(entities);
     }
 
     @Async

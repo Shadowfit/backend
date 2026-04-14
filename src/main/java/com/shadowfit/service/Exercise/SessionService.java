@@ -52,6 +52,10 @@ public class SessionService {
         session.setStatus(Status.COMPLETED);
         session.setEndTime(LocalDateTime.now());
 
+        session.setTotalReps(request.getTotalReps());
+        session.setAvgSyncRate(java.math.BigDecimal.valueOf(request.getAvgSyncRate()));
+        session.setCaloriesBurned(java.math.BigDecimal.valueOf(request.getCaloriesBurned()));
+
         sessionRepository.save(session);
     }
 }
