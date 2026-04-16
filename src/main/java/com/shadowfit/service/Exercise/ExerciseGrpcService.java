@@ -66,6 +66,7 @@ public class ExerciseGrpcService extends ExerciseServiceGrpc.ExerciseServiceImpl
     public void completeAnalysis(com.shadowfit.grpc.SessionCompleteRequest request,
                                  io.grpc.stub.StreamObserver<com.shadowfit.grpc.SessionCompleteResponse> responseObserver) {
         try {
+            // AI 서버가 보내온 gRPC 데이터를 SessionService를 통해 DB에 반영
             sessionService.completeSession(request);
 
             SessionCompleteResponse response = SessionCompleteResponse.newBuilder()
@@ -76,12 +77,10 @@ public class ExerciseGrpcService extends ExerciseServiceGrpc.ExerciseServiceImpl
 
             responseObserver.onNext(response);
             responseObserver.onCompleted();
-            log.info("세션 분석 완료 처리 성공 - 세션 ID: {}", request.getSessionId());
+            log.info("AI 서버 gRPC에 의한 세션 종료 성공 - 세션 ID: {}", request.getSessionId());
         } catch (Exception e) {
-            log.error("세션 종료 처리 중 에러: {}", e.getMessage());
-            responseObserver.onError(io.grpc.Status.INTERNAL
-                    .withDescription(e.getMessage())
-                    .asRuntimeException());
+            log.error("세션 종료 gRPC 처리 중 에러: {}", e.getMessage());
+            responseObserver.onError(e);
         }
     }
 }

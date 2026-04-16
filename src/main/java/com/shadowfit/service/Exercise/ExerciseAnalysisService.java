@@ -2,13 +2,11 @@ package com.shadowfit.service.Exercise;
 
 import com.shadowfit.dto.exercises.FastApiRequestDto;
 import com.shadowfit.dto.exercises.VideoRequestDto;
+import com.shadowfit.dto.exercises.session.SessionUpdateRequestDto;
 import com.shadowfit.global.error.BusinessException;
 import com.shadowfit.global.error.ErrorCode;
 import com.shadowfit.global.util.YoutubeValidator;
-import com.shadowfit.grpc.AnalyzeResponse;
-import com.shadowfit.grpc.ExerciseServiceGrpc;
-import com.shadowfit.grpc.AnalyzeRequest;
-import com.shadowfit.grpc.PoseDataRequest;
+import com.shadowfit.grpc.*;
 import com.shadowfit.model.exercise.Exercise;
 import com.shadowfit.model.exercise.ExerciseReference;
 import com.shadowfit.model.exercise.Session;
@@ -49,30 +47,25 @@ public class ExerciseAnalysisService {
     private ExerciseServiceGrpc.ExerciseServiceStub exerciseAsyncStub;
 
     /**
-     * [쪼개기 1] 기준 좌표 추출 전용 메서드 (등록 단계)
-     * 컨트롤러에서 받은 유튜브 URL을 FastAPI에게 gRPC로 전달합니다.
+     * ✅ 기준 좌표 추출 (FastAPI gRPC 호출)
      */
     public void extractReferencePoses(Long exerciseId, String youtubeUrl) {
-        // 1. gRPC 요청 객체 생성 (ExtractRequest는 proto에 정의한 그 이름이어야 합니다)
         com.shadowfit.grpc.ExtractRequest request = com.shadowfit.grpc.ExtractRequest.newBuilder()
                 .setExerciseId(exerciseId)
-                .setYoutubeUrl(youtubeUrl) // 유튜브 URL 전달
+                .setYoutubeUrl(youtubeUrl)
                 .build();
 
         log.info("FastAPI에게 기준 좌표 추출 요청 전송 - 운동 ID: {}", exerciseId);
 
-        // 2. gRPC 비동기 호출
         exerciseAsyncStub.extractReferenceData(request, new StreamObserver<com.shadowfit.grpc.ExtractResponse>() {
             @Override
             public void onNext(com.shadowfit.grpc.ExtractResponse value) {
                 log.info("FastAPI 추출 시작 응답 수신 - 운동 ID: {}", value.getExerciseId());
             }
-
             @Override
             public void onError(Throwable t) {
                 log.error("좌표 추출 gRPC 통신 장애: {}", t.getMessage());
             }
-
             @Override
             public void onCompleted() {
                 log.info("좌표 추출 gRPC 요청 완료");
@@ -80,29 +73,30 @@ public class ExerciseAnalysisService {
         });
     }
 
-
+    /**
+     * ✅ 운동 분석 시작 (핵심 로직)
+     */
     @Transactional
     public Long startAnalysis(VideoRequestDto appDto, Long currentMemberId) {
-        // 1. 세션 생성 (상태는 READY 또는 IN_PROGRESS)
         Session savedSession = sessionService.createSession(appDto, currentMemberId);
         Long sessionId = savedSession.getId();
 
-        // 2. [핵심] 외부 전용(Spring -> FastAPI) 메서드를 비동기로 호출
-        // 여기서 appDto와 sessionId를 넘겨줍니다.
+        // 비동기로 FastAPI에 분석 요청
         this.sendAnalysisRequestToFastApi(sessionId, appDto);
 
-        return sessionId; // 0.1초 만에 앱으로 반환!
+        return sessionId;
     }
 
-    @Async // 별도 스레드에서 실행
-    @Transactional(readOnly = true) // DB 조회용 트랜잭션
+    /**
+     * ✅ 비동기 FastAPI 전송 로직
+     */
+    @Async
+    @Transactional(readOnly = true)
     public void sendAnalysisRequestToFastApi(Long sessionId, VideoRequestDto appDto) {
         log.info("비동기 분석 요청 시작 - 세션 ID: {}", sessionId);
 
-        // 1. DB에서 정석 좌표 리스트를 긁어온다.
         List<ExerciseReference> referencePoses = referenceRepository.findByExerciseId(appDto.getExerciseId());
 
-        // 2. gRPC 요청 빌드
         AnalyzeRequest.Builder requestBuilder = AnalyzeRequest.newBuilder()
                 .setExerciseId(appDto.getExerciseId())
                 .setSessionId(sessionId)
@@ -115,7 +109,6 @@ public class ExerciseAnalysisService {
                     .build());
         }
 
-        // 3. gRPC 비동기 호출 (FastAPI 서버로 슛!)
         exerciseAsyncStub.startAnalysis(requestBuilder.build(), new StreamObserver<AnalyzeResponse>() {
             @Override
             public void onNext(AnalyzeResponse value) {
@@ -132,15 +125,57 @@ public class ExerciseAnalysisService {
         });
     }
 
+    /**
+     * ✅ AI 서버에 분석 중단 명령 전송
+     */
+    public void stopAnalysis(Long sessionId) {
+        log.info("AI 서버 분석 중단 요청 전송 - sessionId: {}", sessionId);
 
+        com.shadowfit.grpc.StopRequest request = com.shadowfit.grpc.StopRequest.newBuilder()
+                .setSessionId(sessionId.intValue())
+                .build();
 
+        exerciseAsyncStub.stopAnalysis(request, new io.grpc.stub.StreamObserver<com.shadowfit.grpc.StopResponse>() {
+            @Override
+            public void onNext(com.shadowfit.grpc.StopResponse value) {
+                log.info("AI 서버 응답: {}", value.getMessage());
+            }
+            @Override
+            public void onError(Throwable t) {
+                log.error("AI 서버 중단 실패: {}", t.getMessage());
+            }
+            @Override
+            public void onCompleted() {}
+        });
+    }
+
+    /**
+     * ✅ 운동 세션 종료 로직 (DB 업데이트)
+     */
     @Transactional
-    public Long sendToAnalysisServer(VideoRequestDto appDto,Long currentMemberId){
+    public void completeSession(Long sessionId, SessionUpdateRequestDto dto) {
+        Session session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.SESSION_NOT_FOUND));
+
+        session.setTotalReps(dto.getTotalReps());
+        session.setAvgSyncRate(java.math.BigDecimal.valueOf(dto.getAvgSyncRate()));
+        session.setStatus(Status.COMPLETED);
+        session.setEndTime(LocalDateTime.now());
+
+        sessionRepository.save(session);
+        log.info("세션 {} DB 업데이트 완료", sessionId);
+    }
+
+    /**
+     * ✅ 구버전 WebClient 방식 (필요 시 사용)
+     */
+    @Transactional
+    public Long sendToAnalysisServer(VideoRequestDto appDto, Long currentMemberId) {
         Member member = memberRepository.findById(currentMemberId)
-                .orElseThrow(()-> new BusinessException(ErrorCode.USER_NOT_FOUND));
+                .orElseThrow(() -> new BusinessException(ErrorCode.USER_NOT_FOUND));
 
         Exercise exercise = exercisesRepository.findById(appDto.getExerciseId())
-                .orElseThrow(()->new BusinessException(ErrorCode.EXERCISE_NOT_FOUND));
+                .orElseThrow(() -> new BusinessException(ErrorCode.EXERCISE_NOT_FOUND));
 
         Session session = Session.builder()
                 .user(member)
@@ -151,28 +186,6 @@ public class ExerciseAnalysisService {
                 .build();
 
         Session savedSession = sessionRepository.save(session);
-        Long sessionId = savedSession.getId();
-        String youtubeVideoId = YoutubeValidator.extractId(appDto.getReferenceSource());
-
-        //파이썬 dto 생성
-        FastApiRequestDto apiDto = FastApiRequestDto.builder().
-                exerciseId(appDto.getExerciseId())
-                .youtubeUrl(youtubeVideoId)
-                .sessionId(sessionId)
-                .build();
-
-        //파이썬으로 전송
-        webClient.post()
-                .uri("http://localhost:8000/analyze")
-                .header("X-Internal-Token",internalToken)
-                .bodyValue(apiDto)
-                .retrieve()
-                .bodyToMono(Void.class)
-                .doOnSuccess(v->System.out.println("FastAPI 전송 성공: "+sessionId))
-                .doOnError(e->System.err.println("전송 실패: "+e.getMessage()))
-                .subscribe();
-
-        return sessionId;
+        return savedSession.getId();
     }
-
 }
