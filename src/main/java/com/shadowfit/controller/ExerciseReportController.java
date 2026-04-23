@@ -1,6 +1,7 @@
 package com.shadowfit.controller;
 
-import com.shadowfit.dto.report.SessionReportResponseDto;
+import com.shadowfit.dto.report.detailreport.SessionReportResponseDto;
+import com.shadowfit.service.Report.ReportService;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;

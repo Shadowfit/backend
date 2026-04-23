@@ -1,4 +1,4 @@
-package com.shadowfit.dto.report;
+package com.shadowfit.dto.report.record;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
 import lombok.AllArgsConstructor;

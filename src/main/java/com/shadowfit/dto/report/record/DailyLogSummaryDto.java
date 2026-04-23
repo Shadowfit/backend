@@ -1,4 +1,4 @@
-package com.shadowfit.dto.report;
+package com.shadowfit.dto.report.record;
 
 import lombok.AllArgsConstructor;
 import lombok.Getter;

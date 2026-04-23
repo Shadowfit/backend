@@ -1,5 +1,6 @@
-package com.shadowfit.dto.report;
+package com.shadowfit.dto.report.record;
 
+import com.shadowfit.dto.report.detailreport.ExerciseSessionDto;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;

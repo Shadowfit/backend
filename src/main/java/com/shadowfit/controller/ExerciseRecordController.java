@@ -1,9 +1,10 @@
 package com.shadowfit.controller;
 
-import com.shadowfit.dto.report.CalendarMainResponseDto;
-import com.shadowfit.dto.report.DailyLogRequestDto;
-import com.shadowfit.dto.report.WeeklyActivityResponseDto;
+import com.shadowfit.dto.report.record.CalendarMainResponseDto;
+import com.shadowfit.dto.report.record.DailyLogRequestDto;
+import com.shadowfit.dto.report.record.WeeklyActivityResponseDto;
 import com.shadowfit.service.Exercise.SessionService;
+import com.shadowfit.service.Report.DailyLogServcie;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -18,7 +19,7 @@ import org.springframework.web.bind.annotation.*;
 @Slf4j
 public class ExerciseRecordController {
     private final SessionService sessionService;
-    private final DailyLogService dailyLogService;
+    private final DailyLogServcie dailyLogService;
 
     @GetMapping("/weekly-summary")
     public ResponseEntity<WeeklyActivityResponseDto> getWeeklySummary(@AuthenticationPrincipal Long memberId) {
