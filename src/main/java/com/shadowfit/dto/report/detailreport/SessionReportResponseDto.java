@@ -13,19 +13,14 @@ import java.util.List;
 @AllArgsConstructor
 public class SessionReportResponseDto {
     private Long sessionId;
+    private int avgSyncRate;
+    private int totalReps;
+    private int workoutMinutes;
+    private int caloriesBurned;
+    private String aiSafetyReport;
 
-    // 상단 4개 요약 카드용
-    private int avgSyncRate;             // 89 (%)
-    private int totalReps;               // 156
-    private int workoutMinutes;          // 35
-    private int caloriesBurned;          // 250
-
-    // 종목별 싱크로율 리스트 (디자인의 프로그레스 바 영역)
+    private WorstSectionDto worstSection;
     private List<ExerciseSyncRateDto> syncRateDetails;
 
-    // Worst 구간 분석 (디자인의 노란색 경고창 영역)
-    private WorstSectionDto worstSection;
-
-    // AI 안전 리포트 (하단 텍스트 영역)
-    private String aiSafetyReport;       // "페이스풀 시 승모근이 과도하게..."
+    private ComparisonWithPreviousDto comparisonWithPrevious;
 }

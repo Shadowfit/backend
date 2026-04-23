@@ -1,5 +1,6 @@
 package com.shadowfit.service.Exercise;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.shadowfit.dto.exercises.VideoRequestDto;
 import com.shadowfit.dto.report.record.CalendarDayDto;
 import com.shadowfit.dto.report.record.CalendarMainResponseDto;
@@ -26,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+
 //공통세션
 @Service
 @RequiredArgsConstructor
@@ -33,6 +35,7 @@ public class SessionService {
     private final SessionRepository sessionRepository;
     private final ExercisesRepository exercisesRepository;
     private final MemberRepository memberRepository;
+    private final ObjectMapper objectMapper;
 
     /**
      * [세션 생성] 새로운 운동 분석 프로세스를 시작하기 위한 초기 레코드를 생성합니다.
@@ -105,6 +108,7 @@ public class SessionService {
 
     @Transactional(readOnly = true)
     public WeeklyActivityResponseDto getWeeklyActivity(Long memberId) {
+
         // 1. 이번 주 시작일(월)과 종료일(일) 계산
         LocalDate today = LocalDate.now();
         LocalDate startOfWeek = today.with(java.time.DayOfWeek.MONDAY);
@@ -114,23 +118,27 @@ public class SessionService {
         List<Session> weeklySessions = sessionRepository.findByUserIdAndStartTimeBetween(
                 memberId, startOfWeek.atStartOfDay(), endOfWeek.atTime(23, 59, 59));
 
-        // 3. 통계 계산
+        // 3. 통계 계산 (Duration 계산 시 NPE 방어)
         int totalMinutes = weeklySessions.stream()
-                .mapToInt(this::calculateDuration)
+                .mapToInt(s -> {
+                    if (s.getStartTime() == null || s.getEndTime() == null) return 0;
+                    return (int) java.time.Duration.between(s.getStartTime(), s.getEndTime()).toMinutes();
+                })
                 .sum();
 
+        // BigDecimal -> Double 변환 최적화
         double totalCalories = weeklySessions.stream()
                 .map(s -> s.getCaloriesBurned() != null ? s.getCaloriesBurned() : java.math.BigDecimal.ZERO)
                 .mapToDouble(java.math.BigDecimal::doubleValue)
                 .sum();
 
-        // 4. 요일별 그래프 데이터 가공 (DailyLogSummaryDto 리스트 생성)
+        // 4. 요일별 그래프 데이터 가공
         List<DailyLogSummaryDto> dailyLogs = new ArrayList<>();
         for (int i = 0; i < 7; i++) {
             LocalDate date = startOfWeek.plusDays(i);
             int dailyMins = weeklySessions.stream()
-                    .filter(s -> s.getStartTime().toLocalDate().equals(date))
-                    .mapToInt(this::calculateDuration)
+                    .filter(s -> s.getStartTime() != null && s.getStartTime().toLocalDate().equals(date))
+                    .mapToInt(s -> (int) java.time.Duration.between(s.getStartTime(), s.getEndTime()).toMinutes())
                     .sum();
 
             dailyLogs.add(new DailyLogSummaryDto(
@@ -139,6 +147,25 @@ public class SessionService {
                     date.equals(today)
             ));
         }
+
+        List<com.shadowfit.dto.report.detailreport.ExerciseSessionDto> todayDetails = weeklySessions.stream()
+                .filter(s -> s.getStartTime() != null && s.getStartTime().toLocalDate().equals(today))
+                .map(s -> {
+                    com.shadowfit.dto.report.detailreport.ExerciseSessionDto detail = new com.shadowfit.dto.report.detailreport.ExerciseSessionDto();
+
+                    detail.setSessionId(s.getId());
+                    detail.setExerciseName(s.getExercise().getName());
+
+                    // 🚩 세트와 횟수를 하나의 문자열로 합쳐서 세팅!
+                    // 세트 정보가 DB에 따로 없다면 일단 0세트나 횟수만 표시하게끔 처리합니다.
+                    detail.setSetSummary(String.format("0세트 x %d회", s.getTotalReps()));
+
+                    detail.setSyncRate(s.getAvgSyncRate() != null ? s.getAvgSyncRate().doubleValue() : 0.0);
+
+                    return detail;
+                })
+                .collect(Collectors.toList());
+
         return WeeklyActivityResponseDto.builder()
                 .dateRange(String.format("%d월 %d일 - %d일",
                         startOfWeek.getMonthValue(), startOfWeek.getDayOfMonth(), endOfWeek.getDayOfMonth()))
@@ -146,6 +173,7 @@ public class SessionService {
                 .totalMinutes(totalMinutes)
                 .totalCalories((int) totalCalories)
                 .dailyLogs(dailyLogs)
+                .todayDetails(todayDetails)
                 .build();
     }
 
@@ -169,13 +197,30 @@ public class SessionService {
         List<CalendarDayDto> dayDtos = monthlySessions.stream()
                 .map(s -> s.getStartTime().toLocalDate())
                 .distinct()
-                .map(date -> new CalendarDayDto()) // 운동한 날은 true
+                .map(date -> {
+                    CalendarDayDto dto = new CalendarDayDto();
+                    dto.setDate(date.toString());
+                    dto.setHasRecord(true);
+
+                    double dailyAvg = monthlySessions.stream()
+                            .filter(s -> s.getStartTime().toLocalDate().equals(date))
+                            .mapToDouble(s -> s.getAvgSyncRate() != null ? s.getAvgSyncRate().doubleValue() : 0.0)                            .average()
+                            .orElse(0.0);
+
+                    dto.setDailyAvgSyncRate(dailyAvg);
+
+                    return dto;
+                })
                 .collect(Collectors.toList());
 
         CalendarMainResponseDto response = new CalendarMainResponseDto();
         response.setMonthlyExerciseDays((int) monthlySessions.stream().map(s -> s.getStartTime().toLocalDate()).distinct().count());
         response.setTotalAvgSyncRate((int) avgSyncRate);
         response.setConsecutiveDays(calculateConsecutiveDays(memberId)); // 연속 일수 계산 유틸 호출
+
+        response.setYear(year);   // 파라미터로 받은 year 세팅
+        response.setMonth(month); // 파라미터로 받은 month 세팅
+
         response.setRecords(dayDtos);
 
         return response;

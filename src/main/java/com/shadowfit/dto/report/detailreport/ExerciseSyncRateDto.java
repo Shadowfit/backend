@@ -1,10 +1,14 @@
 package com.shadowfit.dto.report.detailreport;
 
+import lombok.AllArgsConstructor;
 import lombok.Getter;
+import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 @Getter
 @Setter
+@NoArgsConstructor
+@AllArgsConstructor
 public class ExerciseSyncRateDto {
     private Long exerciseId;
     private String name;                 // "숄더프레스"
