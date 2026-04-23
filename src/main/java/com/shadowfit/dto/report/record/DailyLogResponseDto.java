@@ -31,4 +31,5 @@ public class DailyLogResponseDto {
         this.memo = entity.getMemo();
         this.totalExerciseTime = entity.getTotalExerciseTime();
         this.totalCalories = entity.getTotalCalories();
+    }
 }

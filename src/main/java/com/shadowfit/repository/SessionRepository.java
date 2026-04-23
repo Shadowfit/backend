@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -20,4 +21,6 @@ public interface SessionRepository extends JpaRepository<Session,Long> {
     Optional<Session> findFirstByUserIdAndExerciseIdAndStatusOrderByStartTimeDesc(
             Long userId, Long exerciseId, Status status
     );
+
+    List<Session> findByUserIdAndStartTimeBetween(Long userId, LocalDateTime start, LocalDateTime end);
 }
