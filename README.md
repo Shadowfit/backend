@@ -169,8 +169,3 @@ sequenceDiagram
 
 ---
 
-<div align="center">
-
-팀 프로젝트 원본은 [SMU-2026-1-capstone-project](https://github.com/SMU-2026-1-capstone-project)에서 확인할 수 있습니다.
-
-</div>
