@@ -1,0 +1,372 @@
+-- ============================================================================
+-- V1 baseline — 스키마 정본 (이슈 #115, docs/decisions/schema-migration-tracking.md)
+-- ============================================================================
+--
+-- 이 파일은 예전 `mysql/schema.sql` 이다. Flyway 도입(§8 결정)으로 위치만 옮겼고
+-- 테이블 정의는 그대로다 — git mv 로 옮겨 이력이 이어진다.
+--
+-- ⚠️ 이 파일을 고치지 말 것. 이미 적용된 마이그레이션이라 Flyway 가 checksum 으로
+--    감시한다. 내용을 바꾸면 다음 부팅이 실패한다.
+--    스키마를 바꾸려면 V3, V4 … 새 파일을 추가한다.
+--
+-- ⚠️ CREATE DATABASE / USE 를 뺐다. Flyway 는 이미 연결된 DB(spring.datasource.url
+--    의 스키마) 위에서 실행하므로 파일이 DB 를 고르면 안 된다. DB 생성은 각 환경이
+--    담당한다 — docker-compose 는 MYSQL_DATABASE 로, 실측 rig 는 자체 CREATE 로.
+--
+-- 기존 인스턴스는 baselineVersion=2 로 도장을 찍어 이 파일을 건너뛴다(이미 그 상태다).
+-- 신규 설치만 실제로 실행된다.
+-- ============================================================================
+
+-- 인코딩 강제 (한글 깨짐 방지). 클라이언트 charset이 latin1 이어도 utf8mb4 로 협상.
+SET NAMES utf8mb4;
+
+-- 2. 사용자 테이블 (Member)
+CREATE TABLE IF NOT EXISTS users (
+                                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                     email VARCHAR(100) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    sex ENUM('MALE', 'FEMALE', 'NONE') DEFAULT 'NONE',
+    role VARCHAR(20) DEFAULT 'USER', -- UserRole enum(USER/ADMIN)의 실제 EnumType.STRING 값과 일치 (2026-07-15 정정, 기존 'ROLE_USER'는 한 번도 안 쓰이던 값)
+    profile_image_url VARCHAR(500),
+    height DECIMAL(5,1),
+    weight DECIMAL(5,1),
+    workout_level VARCHAR(20),
+    selected_persona ENUM('BEGINNER', 'ADVANCED', 'DIET', 'REHAB') NOT NULL DEFAULT 'BEGINNER',
+    preferred_url VARCHAR(500),
+    onboarding_completed BOOLEAN DEFAULT FALSE,
+    tts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    tts_speed DECIMAL(3,1) NOT NULL DEFAULT 1.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- DATETIME 대신 TIMESTAMP 권장 (타임존 대응)
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, -- 자동 갱신 설정
+    -- 관리자 회원 목록 전용 (admin-page-scope.md §4 ㄱ안, 2026-08-03).
+    -- 이 테이블에는 보조 인덱스가 없었다 — 지금까지 users 조회가 전부 PK/UNIQUE 단건이었기
+    -- 때문이다. 관리자 목록은 반대로 member_id 조건 없이 전체를 기간·정렬로 훑는다.
+    -- 기본 정렬이 가입일 최신순이고 기간 필터가 유일한 범위 조건이라 created_at 단일로 잡는다.
+    -- 다른 필터(페르소나·레벨·온보딩)는 선택도가 낮은 enum/boolean 이라 선두로 세울 값이 없다.
+    INDEX idx_users_created_at (created_at)
+    );
+
+-- 2-1. 리프레시 토큰 (RefreshToken.java — 기존에 ddl-auto=update로 암묵 생성되던 테이블, 2026-07-15 명시화)
+CREATE TABLE IF NOT EXISTS refresh_token (
+                                     member_id BIGINT PRIMARY KEY,
+                                     token VARCHAR(512) NOT NULL,
+                                     FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+-- 3. 운동 종목 마스터
+CREATE TABLE IF NOT EXISTS exercises (
+                                         id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                         name VARCHAR(100) NOT NULL,
+    category ENUM('LOWER', 'BACK', 'UPPER', 'CORE', 'FULL') NOT NULL,
+    description TEXT,
+    preferred_url VARCHAR(500),
+    target_joints JSON,
+    sync_threshold_beginner DECIMAL(5,2) DEFAULT 60.00,
+    sync_threshold_advanced DECIMAL(5,2) DEFAULT 85.00,
+    sync_threshold_diet DECIMAL(5,2) DEFAULT 70.00,
+    sync_threshold_rehab DECIMAL(5,2) DEFAULT 50.00,
+    expected_duration_minutes INT DEFAULT 15,
+    -- AI 서버가 이 종목 분석을 실제로 지원하는지. 기본 FALSE — 종목 행이 먼저 생기고 분석기가
+    -- 나중에 붙는 순서라, 기본을 TRUE로 두면 준비 전에 세션이 열린다(현재 TRUE는 스쿼트뿐).
+    analysis_supported BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- DEFAULT 추가
+    );
+
+-- 4. 운동별 기준 자세 데이터
+CREATE TABLE IF NOT EXISTS exercise_references (
+                                                   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                                   exercise_id BIGINT NOT NULL,
+                                                   timestamp_sec DECIMAL(10,3) NOT NULL,
+    joint_coordinates JSON NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- DEFAULT 추가
+    FOREIGN KEY (exercise_id) REFERENCES exercises(id) ON DELETE CASCADE,
+    INDEX idx_exercise_ref_id (exercise_id)
+    );
+
+-- 5. 운동 세션
+CREATE TABLE IF NOT EXISTS exercise_sessions (
+                                                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                                 member_id BIGINT NOT NULL,
+                                                 exercise_id BIGINT NOT NULL,
+                                                 reference_source VARCHAR(500),
+    start_time DATETIME NOT NULL,
+    end_time DATETIME,
+    -- 마지막으로 활동이 관측된 시각 (session-liveness-vs-elapsed-time.md ㄷ안).
+    -- rep 이 완성돼 SavePoseDataBatch 가 들어올 때 갱신된다 — Spring 은 개별 프레임을 받지
+    -- 않으므로 이것이 얻을 수 있는 가장 촘촘한 활동 신호다.
+    -- NULL 이면 "아직 rep 이 하나도 없음"이고, 그때는 기존 식(start_time 앵커)으로 폴백한다.
+    last_active_at DATETIME,
+    total_reps INT DEFAULT 0,
+    avg_sync_rate DECIMAL(5,2),
+    max_sync_rate DECIMAL(5,2),
+    min_sync_rate DECIMAL(5,2),
+    calories_burned DECIMAL(7,2),
+    difficulty_level INT DEFAULT 1,
+    status ENUM('IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'FAILED') DEFAULT 'IN_PROGRESS',
+    version BIGINT NOT NULL DEFAULT 0, -- 낙관적 락 (JPA @Version)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- DEFAULT 추가
+    FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (exercise_id) REFERENCES exercises(id),
+    -- 🔀 2026-08-07 통합 — 원래 여기엔 인덱스가 둘이었다(이슈 #110, session-index-composition.md).
+    --    idx_session_member_starttime      (member_id, start_time)  — 캘린더/주간활동
+    --    idx_session_member_status         (member_id, status)      — 활성 세션 확인·탈퇴 가드
+    --
+    -- 왜 합쳤나 — (member_id, status) 가 "일하는 척"만 하고 있었다.
+    --   GET /sessions/active 의 findFirstByMemberIdAndStatusOrderByStartTimeDesc 는 등치 둘에
+    --   ORDER BY start_time LIMIT 1 인데, (member_id, status) 는 정렬을 못 받친다. 그래서
+    --   옵티마이저가 정렬 비용을 보고 idx_session_member_exercise_status_start 로 도망가
+    --   **회원의 전 세션을 읽고 정렬했다.** 회원당 세션 2000건이면 2001행을 읽는다.
+    --
+    --   (member_id, status, start_time) 이면 앞 둘이 등치로 고정된 뒤 남은 구간이 이미
+    --   start_time 순이라 LIMIT 1 이 **진짜 1행**이 된다. 팬아웃과 무관한 상수다.
+    --
+    -- 컬럼 순서 — status 가 앞인 이유(반사실 (member_id, start_time, status) 도 실측했다):
+    --   뒤집으면 status 로 못 좁혀 탈퇴 가드가 정확히 2배를 읽는다. 그리고 뒤집은 쪽이
+    --   GET /sessions/active 에서 선방한 것은 인덱스가 아니라 **분포 덕**이었다 — 최신순으로
+    --   훑으며 status 를 필터로 확인하므로 찾는 값이 흔할수록 빨리 멈춘다. 실제로 찾는
+    --   IN_PROGRESS 는 회원당 많아야 1건이라 그 최악은 rig 가 재지 않았다. 이쪽은 status 가
+    --   아무리 드물어도 1행이라 그 위험이 없다.
+    --
+    -- 대가: 주간 리포트(member_id + start_time 범위)가 status 를 건너뛰어야 해 읽는 행이
+    --   14 → 20 으로 는다(팬아웃 500 기준, 절대 0.03ms). GET /sessions/active 보다 훨씬
+    --   덜 뜨거운 쿼리라 감수한다.
+    INDEX idx_session_member_status_start (member_id, status, start_time),
+    -- 직전 동일 운동 조회(findFirstByMemberIdAndExerciseIdAndStatusOrderByStartTimeDesc, 이전 기록
+    -- 비교용)가 위 인덱스만으론 member_id로 찾은 뒤 exercise_id·status를 filter(Using where,
+    -- filtered 5.19%)하는 게 EXPLAIN으로 확인돼 추가 (2026-07-15, filtered 100%로 개선)
+    INDEX idx_session_member_exercise_status_start (member_id, exercise_id, status, start_time),
+    -- 관리자 세션 목록 전용 (admin-page-scope.md §4 ㄱ안, 2026-08-03).
+    -- 위 두 인덱스는 전부 member_id 선두다 — 지금까지의 모든 조회가 "내 데이터"였으므로
+    -- 올바른 설계였다. 관리자 목록은 member_id 조건 없이 상태·기간으로 전체를 거르므로
+    -- 선두 컬럼이 안 맞아 둘 다 타지 않는다. 같은 테이블에 읽기 주체가 둘이면 인덱스
+    -- 전략이 갈린다.
+    -- (이 주석을 쓸 당시엔 셋이었다 — 2026-08-07 통합(#110)으로 둘이 됐고 논지는 그대로다.)
+    --
+    -- (status, start_time) 순서인 이유: status 는 등치, start_time 은 범위·정렬이다.
+    -- 등치를 선두에 두어야 범위 조건이 인덱스 순서를 그대로 쓴다. 뒤집으면 status 가
+    -- 인덱스로 안 걸러져 filesort 가 남는다.
+    --
+    -- ⚠️ 쓰기 비용이 공짜가 아니다 — 세션 INSERT 는 이 프로젝트의 핵심 쓰기 축이다.
+    -- 실측은 loadtest/measure_admin_index.sh.
+    INDEX idx_session_status_starttime (status, start_time),
+    -- 대시보드 활성 회원 집계 e 전용 (admin-page-scope.md §4-5-1 후보 ㉲, 2026-08-07 추가).
+    -- COUNT(DISTINCT member_id) WHERE start_time >= ? 인데, 이걸 붙이기 전에는 옵티마이저가
+    -- (member_id, start_time) 을 골랐다 — COUNT(DISTINCT member_id) 의 중복 제거는 공짜가
+    -- 되지만 **기간으로 seek 를 못 해 100만 행을 읽고 98%를 버렸다.** 355ms → 13.6ms(26배).
+    --
+    -- (start_time, member_id) 순서인 이유: start_time 이 범위 조건이고 member_id 는 집계
+    -- 대상일 뿐 조건이 아니다. 범위를 선두에 둬야 seek 가 되고, member_id 는 뒤에 실려
+    -- 커버링만 만족시키면 된다.
+    --
+    -- ⚠️ 이쪽은 중복 제거가 공짜가 **아니다** — member_id 는 같은 start_time 안에서만 정렬돼
+    -- 있어 기간 범위 전체로 보면 전역 정렬이 아니다. 즉 이 인덱스는 **맞바꾼 것**이다:
+    -- 공짜 중복 제거를 포기하고 seek(100만 → 2만 행)을 샀고, 그 순차이가 26배다.
+    -- 남은 DISTINCT 를 MySQL 이 어떻게 처리하는지(임시 테이블 여부)는 미확인.
+    --
+    -- ⚠️ 위 통합(#110)이 선결이었다. 통합 전이면 보조 인덱스가 5개가 되는데, 이 테이블은
+    -- 인덱스가 데이터의 2배라(138.9MB vs 69.6MB, 100만 행) 개수를 늘리는 대가가 크다.
+    -- 통합으로 4 → 3 이 된 뒤에 얹어 **총 4개로 이전과 같다.**
+    --
+    -- start_time 은 now() 로 들어와 append 라 쓰기 대가가 작다. 실측 1.007배(§4-5-1).
+    -- ⚠️ 단 그 1.007배는 **이 인덱스 하나를 5개 위에 더 얹었을 때**의 값이다(통합 전 기준).
+    --    지금 구성은 2개를 빼고 2개를 넣은 4개라 기준선이 다르다 — 통합 전·후로 재측정한 값이
+    --    아니므로 "이 구성의 쓰기 대가"로 인용하지 말 것. 재측정은 미수행.
+    INDEX idx_session_starttime_member (start_time, member_id)
+    );
+
+-- 6. 자세 데이터
+-- pose_data: 날짜 파티셔닝 적용 (TTL 만료 시 DROP PARTITION이 DELETE보다 ~625배 빠름,
+-- 실측: loadtest/measure_partition.sh, docs/portfolio/realmysql-experiments.md).
+-- MySQL/InnoDB는 FK 걸린 테이블의 파티셔닝을 지원 안 해서(ERROR 1506) 아래 두 가지를 함께 변경:
+--   1) FK(session_id → exercise_sessions, ON DELETE CASCADE) 제거
+--      → 참조무결성은 애플리케이션이 대체: INSERT 시 세션 존재 검증(PoseDataService.savePoseDataBatch),
+--        회원 탈퇴 시 이벤트 트리거 비동기 정리(MemberService.deleteAccount, PoseDataCleanupService)
+--      → docs/decisions/pose-data-partition-fk-tradeoff.md 참조
+--   2) PK를 id 단일키 → (id, created_at) 복합키로 변경 (파티션 키가 모든 유니크키에 포함돼야 하는 제약)
+CREATE TABLE IF NOT EXISTS pose_data (
+                                         id BIGINT AUTO_INCREMENT,
+                                         session_id BIGINT NOT NULL,
+    -- 이 프레임이 속한 rep 번호 (1-based, 0=미상). 재부착 시 MAX(rep_number) 로 rep 카운트를 복원한다
+    -- (이슈 #59 2단계, docs/decisions/session-resume-and-ai-state.md §3-3).
+    rep_number INT NOT NULL DEFAULT 0,
+                                         timestamp_sec DECIMAL(10,3) NOT NULL, -- [수정] 소수점 타임스탬프 대응을 위해 DECIMAL로 변경
+    joint_coordinates JSON NOT NULL,
+    sync_rate DECIMAL(5,2) NOT NULL,
+    -- 좌우 무릎각 평균을 최근 3프레임으로 평활한 값(도, 0=미상). 작을수록 깊게 앉은 것이다.
+    -- sync_rate 는 rep 단위 상수라 프레임을 구분하지 못하는데 joint_coordinates 는 프레임마다
+    -- 다르므로, 다운샘플에서 남길 프레임과 리포트 대표 프레임을 고르는 기준이 이 값이다
+    -- (docs/decisions/worst-section-rep-resolution.md §4-ㄹ).
+    smoothed_knee_angle DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+    -- is_correct 는 2026-08-01 삭제했다 — 읽는 곳이 없었고, sync_rate 에서 파생된 값인데
+    -- 임계값(40)을 쓰기 시점에 굳혀 저장해 AI 의 persona 임계값과 한 행 안에서 모순됐다.
+    -- migrations/2026-08-01-add-pose-data-smoothed-knee-angle.sql
+    feedback_message VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, created_at),
+    INDEX idx_session_timestamp (session_id, timestamp_sec)
+    )
+    PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (
+      PARTITION p2026_01 VALUES LESS THAN (UNIX_TIMESTAMP('2026-02-01 00:00:00')),
+      PARTITION p2026_02 VALUES LESS THAN (UNIX_TIMESTAMP('2026-03-01 00:00:00')),
+      PARTITION p2026_03 VALUES LESS THAN (UNIX_TIMESTAMP('2026-04-01 00:00:00')),
+      PARTITION p2026_04 VALUES LESS THAN (UNIX_TIMESTAMP('2026-05-01 00:00:00')),
+      PARTITION p2026_05 VALUES LESS THAN (UNIX_TIMESTAMP('2026-06-01 00:00:00')),
+      PARTITION p2026_06 VALUES LESS THAN (UNIX_TIMESTAMP('2026-07-01 00:00:00')),
+      PARTITION p2026_07 VALUES LESS THAN (UNIX_TIMESTAMP('2026-08-01 00:00:00')),
+      PARTITION p2026_08 VALUES LESS THAN (UNIX_TIMESTAMP('2026-09-01 00:00:00')),
+      PARTITION p2026_09 VALUES LESS THAN (UNIX_TIMESTAMP('2026-10-01 00:00:00')),
+      PARTITION p2026_10 VALUES LESS THAN (UNIX_TIMESTAMP('2026-11-01 00:00:00')),
+      PARTITION p2026_11 VALUES LESS THAN (UNIX_TIMESTAMP('2026-12-01 00:00:00')),
+      PARTITION p2026_12 VALUES LESS THAN (UNIX_TIMESTAMP('2027-01-01 00:00:00')),
+      PARTITION p2027_01 VALUES LESS THAN (UNIX_TIMESTAMP('2027-02-01 00:00:00')),
+      -- 위 범위를 넘는 미래 데이터는 임시로 이 파티션에 적재됨 — 운영 시 주기적으로
+      -- ALTER TABLE ... REORGANIZE PARTITION pfuture INTO (...) 로 월별 파티션을 추가해야 함
+      PARTITION pfuture VALUES LESS THAN MAXVALUE
+    );
+
+-- 7. 달력 일지
+CREATE TABLE IF NOT EXISTS daily_logs (
+                                          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                          member_id BIGINT NOT NULL,
+                                          log_date DATE NOT NULL,
+                                          memo TEXT,
+                                          total_exercise_time INT DEFAULT 0,
+                                          total_calories DECIMAL(7,2) DEFAULT 0,
+    mood ENUM('GREAT', 'GOOD', 'NORMAL', 'BAD', 'TERRIBLE'),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_member_date (member_id, log_date)
+    );
+
+-- 8. 운동 보고서
+CREATE TABLE IF NOT EXISTS reports (
+                                       id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                                       member_id BIGINT NOT NULL,
+                                       session_id BIGINT NOT NULL,
+                                       report_type ENUM('SESSION', 'WEEKLY', 'MONTHLY') DEFAULT 'SESSION',
+    summary TEXT,
+    detailed_analysis JSON,
+    improvement_tips TEXT,
+    comparison_with_previous JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- DEFAULT 추가
+    -- Report 는 BaseTimeEntity 를 상속해 updated_at 을 갖는다(@LastModifiedDate). 이 컬럼이 없어
+    -- INSERT 가 "Unknown column 'updated_at'" 으로 터졌고, precomputeReport 가 세션 완료와 같은
+    -- 트랜잭션이라 세션 COMPLETED 까지 롤백되면서 모든 세션이 FAILED 로 수렴했다(이슈 #66, 실제 재현).
+    -- JPA 감사(auditing)가 값을 직접 써넣으므로 DB DEFAULT/ON UPDATE 는 두지 않는다.
+    updated_at DATETIME NULL,
+    FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES exercise_sessions(id) ON DELETE CASCADE,
+    -- 세션당 리포트 1건 보장 (report 생성 멱등성, db-deep-dive.md §C) — 아래 주석은 스키마 작성
+    -- 당시 기준이며, 현재는 SessionService.precomputeReport 가 세션 완료 시 리포트를 생성한다.
+    -- (그 변경 때 updated_at 추가가 누락돼 위 버그가 생겼다)
+    -- 재시도로 인한 중복 생성을 DB 제약으로 막기 위해 선반영
+    UNIQUE KEY uk_report_session (session_id)
+    );
+
+-- 9-A. 운동별 피드백 메시지 템플릿 (TTS 멘트, 페르소나별 분기)
+-- persona NULL row 는 페르소나 row 없을 때 fallback 으로 사용 (분기 4-A + BE-13)
+CREATE TABLE IF NOT EXISTS exercise_feedback_templates (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exercise_id BIGINT NOT NULL,
+    feedback_type VARCHAR(30) NOT NULL,
+    persona VARCHAR(10) NULL,
+    message VARCHAR(200) NOT NULL,
+    priority INT NOT NULL DEFAULT 100,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (exercise_id) REFERENCES exercises(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_exercise_feedback_persona (exercise_id, feedback_type, persona)
+);
+
+-- 9-B. 세션 피드백 판정 이벤트 로그 (AI 가 BT-SET 으로 batch 송신, 멱등성 보장)
+CREATE TABLE IF NOT EXISTS session_feedback_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id BIGINT NOT NULL,
+    feedback_type VARCHAR(30) NOT NULL,
+    sync_rate_at_trigger DECIMAL(5,2),
+    occurred_at DATETIME NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES exercise_sessions(id) ON DELETE CASCADE,
+    -- idx_session_feedback(session_id, occurred_at)는 2026-07-24 제거 — uk_session_event가 앞 2컬럼을
+    -- 그대로 포함해 읽기 쪽엔 이득 0(EXPLAIN 확인: findBySessionIdOrderByOccurredAtAsc·GROUP BY
+    -- feedback_type 집계 둘 다 옵티마이저가 idx_session_feedback 존재 시에도 uk_session_event만 선택),
+    -- batch INSERT 유지비용만 이중 (production-signal-checklist.md:343, loadtest/measure_redundant_index.sh)
+    UNIQUE KEY uk_session_event (session_id, occurred_at, feedback_type)
+);
+
+-- 10. 신체 변화 기록 (user_id -> member_id 변경)
+-- ⚠️ 현재 Entity/Repository/Service 전부 없는 미구현 테이블(production-signal-checklist.md).
+-- ON DELETE CASCADE는 2026-07-24 선반영 — MemberService.deleteAccount가 memberRepository.delete()
+-- 하나로 회원 삭제를 처리하고 나머지 테이블 정리를 전부 FK CASCADE에 의존하는 구조라, CASCADE 없이
+-- 이 테이블에 쓰기 기능이 생기면 refresh_token과 동일한 FK violation 500 버그가 재현됨(8efbca1에서
+-- refresh_token 대상으로 실제 발견·수정한 바 있음).
+CREATE TABLE body_records (
+                              id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                              member_id BIGINT NOT NULL,          -- 수정 완료
+                              record_date DATE NOT NULL,
+                              weight DECIMAL(5,1),
+                              body_fat_percentage DECIMAL(4,1),
+                              muscle_mass DECIMAL(5,1),
+                              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                              FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE,
+                              INDEX idx_member_date (member_id, record_date)
+);
+-- 11. 아웃박스 (트랜잭셔널 메시징 — 세션 종료 통보 유실 방지)
+-- 설계 근거: docs/decisions/outbox-reliable-messaging.md
+--
+-- endSession 은 "MySQL 커밋"과 "AI 에 gRPC StopAnalysis 송신" 두 곳에 쓰는 dual-write 라,
+-- 두 번째 쓰기가 실패하면(gRPC 오류 / 서킷 OPEN 스킵) 복구 수단이 없었다(at-most-once).
+-- 보낼 통보를 같은 트랜잭션 안에 이 테이블 행으로 INSERT 하고, 별도 발행기가 전달을
+-- 책임진다(at-least-once). 수신측 멱등성(applyComplete first-write-wins)과 합쳐
+-- 통보 전달은 effectively exactly-once 가 된다.
+--   ※ 단 "통보 전달"에 한한다. AI 프로세스가 재시작해 세션 상태를 잃으면 통보는 정확히
+--     전달되지만 분석 결과는 회수되지 않는다(문서 §3-2). outbox 의 결함이 아니라 경계다.
+CREATE TABLE IF NOT EXISTS outbox_events (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    -- 애그리거트 식별. aggregate_id 에 exercise_sessions FK 를 걸지 않는다 — 걸면 outbox 가
+    -- 특정 애그리거트에 종속돼 다른 이벤트 타입으로 확장할 수 없고, 세션 삭제 시 CASCADE 로
+    -- 통보 이력까지 사라진다(문서 §4-1-1). 참조무결성은 발행기가 대체: 대상이 없으면 AI 가
+    -- success=false 를 주고 그때 터미널 FAILED 로 종결된다.
+    aggregate_type  VARCHAR(50)  NOT NULL,                    -- 'SESSION'
+    aggregate_id    BIGINT       NOT NULL,                    -- session_id
+    event_type      VARCHAR(50)  NOT NULL,                    -- 'STOP_ANALYSIS'
+    payload         JSON         NOT NULL,                    -- { "sessionId": 42 }
+    -- 발행기는 @Scheduled 스레드라 MDC 가 비어 있고, outbox 는 스레드가 아니라 시간·프로세스
+    -- 경계를 넘으므로 런타임 캡처(CorrelationIds.wrap)로는 원리상 이을 수 없다. 행에 저장해야
+    -- 원 요청의 흐름과 이어진다(문서 §4-4). MDC 와 달리 이 값은 인스턴스 재시작을 견딘다.
+    correlation_id  VARCHAR(64)  NULL,
+    -- PROCESSING: 발행기가 선점해 송신 중. SKIP LOCKED 만으로는 중복 송신이 안 막힌다 —
+    -- 행 락은 트랜잭션 수명만큼인데 gRPC 송신은 그 트랜잭션 밖에서 일어나므로, 송신 도중
+    -- 크래시하면 행은 PENDING 인 채 남아 다른 발행기가 또 집는다. 그래서 소유권을 "상태 +
+    -- 만료 시각"으로 표현한다(문서 §4-3-1). SKIP LOCKED 는 작업 분배, 중복 방지는 이쪽 담당.
+    status          ENUM('PENDING','PROCESSING','SENT','FAILED') NOT NULL DEFAULT 'PENDING',
+    retry_count     INT          NOT NULL DEFAULT 0,
+    next_retry_at   DATETIME     NULL,                        -- 지수 백오프(1s→2s→4s…, 상한 5분)
+    locked_by       VARCHAR(64)  NULL,                        -- 선점한 발행기 식별(인스턴스 ID)
+    lock_expires_at DATETIME     NULL,                        -- 이 시각이 지난 PROCESSING 은 회수 대상
+    sent_at         DATETIME     NULL,
+    -- 업무 시각은 DATETIME, created_at 만 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    -- (exercise_sessions:69-79 패턴 준수)
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    -- 발행기는 두 갈래를 각각 별도 쿼리로 집는다:
+    --   ① 신규·재시도분: status='PENDING'    AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+    --   ② 유실 회수분:   status='PROCESSING' AND lock_expires_at <= NOW()
+    --
+    -- 인덱스는 ①용 하나만 둔다. 처음엔 ②용 (status, lock_expires_at) 도 같이 뒀는데, 실측해보니
+    -- 둘 다 선두 컬럼이 status 라 옵티마이저가 구분하지 못하고 아무거나 골라 **양쪽 다 status
+    -- 프리픽스만** 쓰고 나머지를 필터링했다(key_len 1, filtered 33~40%). 데이터 분포를 바꿔도
+    -- 동일해 분포 탓이 아니라 구조 탓이었다. ②용을 지우자 ①이 정상화됐다(key_len 7, filtered 100%,
+    -- range + ICP). 2026-07-29 MySQL 8.0.46 실측, EXPLAIN 근거.
+    --
+    -- ②가 인덱스를 못 타는 건 감수한다 — PROCESSING 행은 "지금 송신 중 + 크래시로 묶인 것"뿐이라
+    -- 구조적으로 (배치크기 × 발행기수) 수준(수십 건)을 넘지 않아 좁힐 대상이 애초에 없다. 반면
+    -- ①은 AI 장애 시 수천 건까지 쌓이는 쿼리라 인덱스가 실제로 필요하다. 필요한 쪽만 고친 셈.
+    -- 만약 PROCESSING 이 크게 적체되는 상황이 관측되면 두 시각 컬럼을 visible_at 하나로 합쳐
+    -- (status, visible_at) 단일 인덱스로 가는 안이 있다(SQS visibility timeout 모델, 실측 확인함).
+    INDEX idx_outbox_dispatch (status, next_retry_at)
+) COMMENT='트랜잭셔널 아웃박스 — 세션 종료 통보(STOP_ANALYSIS) 전달 보장';
+-- 보존 정책(문서 §4-1-2): SENT 는 짧게(예: 7일) 후 삭제, 터미널 FAILED 는 길게(예: 90일)
+-- 보존한다 — 지표는 건수만 알려주고 "어느 세션이 유실됐는지"는 이 행에만 남기 때문.
+-- 소량 반복 DELETE 의 파편화 누적은 이 프로젝트에서 미검증이라, 관측되면 created_at 기준
+-- 파티션 + DROP PARTITION(pose_data 에서 검증된 패턴)으로 전환한다.
