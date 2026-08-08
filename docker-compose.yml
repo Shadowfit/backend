@@ -1,0 +1,179 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: shadowfit-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Seoul
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # initdb 마운트를 걷어냈다 (이슈 #115, Flyway 도입).
+      #
+      # 예전엔 schema.sql·data.sql 을 여기에 물려 컨테이너 최초 기동 때 한 번 실행했다.
+      # 그 방식의 문제는 "한 번뿐"이라는 것 — 볼륨이 이미 있으면 두 번 다시 안 돌아서,
+      # 나중에 추가된 마이그레이션이 반영됐는지 아무도 몰랐다(그게 #115 다).
+      #
+      # 이제 스키마는 백엔드가 부팅하며 Flyway 로 적용한다:
+      #   backend/src/main/resources/db/migration/V1__baseline.sql  (구 schema.sql)
+      #   backend/src/main/resources/db/migration/V2__seed_master_data.sql
+      # 빈 DB(MYSQL_DATABASE 가 만든다)만 있으면 되고, 적용 이력은 flyway_schema_history 에 남는다.
+      #
+      # dev 픽스처(테스트 계정·가짜 세션)는 마이그레이션이 아니라 별도 파일이다. 필요할 때:
+      #   docker exec -i shadowfit-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" shadowfit < mysql/dev-seed.sql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/charset.cnf:ro
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --skip-character-set-client-handshake
+      --innodb-buffer-pool-size=2G
+      --innodb-sort-buffer-size=64M
+    healthcheck:
+      # MySQL 전용 헬스체크로 복구
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - shadowfit-net
+
+  shadowfit-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shadowfit-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "6565:6565"
+      # 관리 포트(9090) — **dev 에서만** 호스트에 연다.
+      # docker-compose.prod.yml 에는 이 매핑이 없다. 그게 포트를 분리한 이유 자체다
+      # (외부에 지표를 안 내보낸다, application.yml [6]).
+      # 로컬에서 여는 이유는 verify 스킬이 호스트에서 curl 로 health 를 폴링하기
+      # 때문이다 — 안 열면 로컬 검증 절차가 통째로 막힌다.
+      # 🔴 루프백에 묶는다(#128). 인터페이스를 안 적으면 0.0.0.0 이라 LAN 의 누구나
+      # /actuator/prometheus 를 무인증으로 읽는다 — "보호 수단은 인증이 아니라 포트
+      # 경계"라는 이 설계의 전제가 dev 에서 통째로 깨진다. 용도가 호스트 curl 이므로
+      # 127.0.0.1 로 목적은 그대로다.
+      - "127.0.0.1:9090:9090"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      TZ: Asia/Seoul
+      DB_HOST: shadowfit-mysql
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      AI_SERVER_HOST: shadowfit-ai
+      AI_SERVER_GRPC_PORT: 8585
+      AI_SERVER_HTTP_PORT: 8000
+      JWT_SECRET: ${JWT_SECRET:-shadowfit-prod-secret-key-change-this}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - shadowfit-net
+
+  shadowfit-ai:
+    build:
+      context: ./ai-server
+      dockerfile: Dockerfile
+    container_name: shadowfit-ai
+    restart: unless-stopped
+    # 분기 H2 (프론트 → AI 직결) 채택. HTTP 8000 은 InternalAuthMiddleware
+    # (app/middleware/auth.py) 도입 후 외부 노출 복귀. gRPC 8585 는 Spring 만
+    # 같은 도커 네트워크에서 호출하므로 expose 로 유지 (외부 노출 X).
+    ports:
+      - "8000:8000"
+    expose:
+      - "8585"
+    environment:
+      DEBUG: "false"
+      TZ: Asia/Seoul
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      POSE_MODEL_COMPLEXITY: 1
+      BACKEND_URL: http://shadowfit-backend:8080/api/v1
+    healthcheck:
+      # AI 서버용 파이썬 방식 헬스체크 적용 (curl 대신)
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s # 서버 기동 대기 시간 추가
+    networks:
+      - shadowfit-net
+
+  # ── 관측 스택 ─────────────────────────────────────────────────────────────
+  # 기본으로는 뜨지 않는다. 켤 때만:  docker compose --profile obs up -d
+  #
+  # profile 로 뺀 이유는 취향이 아니라 **측정 오염**이다. 이 개발 장비는 2물리코어에
+  # MySQL+백엔드+AI 가 이미 동거 중이라(load-test-strategy.md 전제), 부하 실험 중에
+  # 관측 스택까지 같이 돌면 무엇 때문에 느려졌는지 구분할 수 없게 된다.
+  # 그래프를 보려고 켠 것이 그래프를 못 믿게 만드는 상황을 만들지 않는다.
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: shadowfit-prometheus
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 보존기간 7일. 이 프로젝트의 용도는 장기 추세가 아니라 "실험 한 판 동안의
+      # 과정"이라, 그보다 길게 잡으면 디스크만 먹는다.
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      # 호스트 9091 — 백엔드 관리포트 9090 과 헷갈리지 않게 어긋냈다.
+      # 루프백 고정(#128): 프로메테우스 UI 는 인증이 아예 없어 노출되면 지표 전량이 공개된다.
+      - "127.0.0.1:9091:9090"
+    networks:
+      - shadowfit-net
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: shadowfit-grafana
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      # 로컬 전용이고 외부에 열지 않는다. 운영에 올릴 때는 반드시 바꿀 것.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # 익명 접근 차단 — 기본값이지만 명시한다.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      TZ: Asia/Seoul
+    volumes:
+      # 프로비저닝 — 대시보드를 손으로 만들지 않는다. 손으로 만들면 그 그래프가
+      # 어떻게 나왔는지 코드에 안 남아서, 재현도 리뷰도 안 된다.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    ports:
+      # 루프백 고정(#128). 아래 기본 비밀번호가 admin 이라, 0.0.0.0 이면 .env 가 없는
+      # 순간 admin/admin 콘솔이 LAN 에 열린다.
+      - "127.0.0.1:3000:3000"
+    networks:
+      - shadowfit-net
+
+networks:
+  shadowfit-net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
