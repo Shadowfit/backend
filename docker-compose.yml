@@ -1,0 +1,451 @@
+version: '3.8'
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: shadowfit-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Seoul
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # initdb 마운트를 걷어냈다 (이슈 #115, Flyway 도입).
+      #
+      # 예전엔 schema.sql·data.sql 을 여기에 물려 컨테이너 최초 기동 때 한 번 실행했다.
+      # 그 방식의 문제는 "한 번뿐"이라는 것 — 볼륨이 이미 있으면 두 번 다시 안 돌아서,
+      # 나중에 추가된 마이그레이션이 반영됐는지 아무도 몰랐다(그게 #115 다).
+      #
+      # 이제 스키마는 백엔드가 부팅하며 Flyway 로 적용한다:
+      #   backend/src/main/resources/db/migration/V1__baseline.sql  (구 schema.sql)
+      #   backend/src/main/resources/db/migration/V2__seed_master_data.sql
+      # 빈 DB(MYSQL_DATABASE 가 만든다)만 있으면 되고, 적용 이력은 flyway_schema_history 에 남는다.
+      #
+      # dev 픽스처(테스트 계정·가짜 세션)는 마이그레이션이 아니라 별도 파일이다. 필요할 때:
+      #   docker exec -i shadowfit-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" shadowfit < mysql/dev-seed.sql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/charset.cnf:ro
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --skip-character-set-client-handshake
+      --innodb-buffer-pool-size=2G
+      --innodb-sort-buffer-size=64M
+    # CPU 상대 우선순위 — 절대 캡이 아니라 기본값(1024) 대비 가중치다(#212). 호스트가
+    # 포화됐을 때만 작동하고 여유가 있으면 아무 영향이 없다. 쓰기 천장이 fsync 인 이 서비스가
+    # AI 추론(코어를 주는 만큼 먹는다, load-test-strategy.md §1)에 밀려 굶는 것을 막는다.
+    cpu_shares: 2048
+    # 메모리 한도 — 이 프로젝트에서 shadowfit-ai(#212)·shadowfit-backend(#570)는 이미 캡이
+    # 있는데 MySQL만 무제한이었다. 2026-08-28 AI 워커 부하-중 장애 라운드
+    # (docs/decisions/ai-worker-load-soak-experiment.md)에서 동접 193세션 부하 90초 만에
+    # 대상 박스 전체(SSH·전 앱 포트)가 무응답이 됐고, MySQL 로그 마지막 줄이 InnoDB
+    # "장기 세마포어 대기" 경고 헤더에서 끊긴 채 시스템이 얼어붙었다 — 락 경합이 강하게
+    # 의심되는 정황이지 확정 원인은 아니다(그 문서 §3-3). 캡이 그 원인을 직접 고치진
+    # 않지만, 최소한 "MySQL이 스왑도 없는 호스트에서 한도 없이 계속 자란다"는 별개
+    # 위험은 없앤다.
+    #
+    # 값의 근거: `--innodb-buffer-pool-size=2G`(위)가 이미 걸려 있는데, 재현 라운드
+    # 착수 전 idle 상태 실측(`docker stats`, 2026-08-28)은 583.7MiB — 버퍼풀의 30%도
+    # 안 된다. JVM 힙(backend#570)과 달리 InnoDB 버퍼풀은 즉시 다 잡지 않고 페이지가
+    # 캐시되며 점진적으로 채워지므로, idle 값을 그대로 "여유 붙여 캡"으로 쓰면 부하가
+    # 버퍼풀을 2G로 채우려는 순간 그대로 OOM 크래시가 날 위험이 크다. 그래서 기준을
+    # idle이 아니라 **설정된 버퍼풀(2G)**로 잡고, 연결 버퍼·딕셔너리 캐시·적응형 해시 등
+    # InnoDB 부가 메모리 몫으로 위에 여유를 얹었다 — "빠듯하게 맞춘 값"이 아니라
+    # "버퍼풀은 확실히 뜨지만 무제한은 아닌" 실질적 상한이다([[feedback_no_arbitrary_threshold_values]]:
+    # baseline은 이 두 실측값, threshold는 그 위에 둔 여유값이라는 걸 그대로 밝혀둔다).
+    #
+    # ⚠️ 부하 중 실제 피크는 미측정이다 — 이 캡을 걸고 같은 강도로 재현을 시도하는 것
+    # 자체가 그 갭을 메우려는 시도다. 재현 결과는 위 문서에 반영한다.
+    mem_limit: ${MYSQL_MEM_LIMIT:-3072m}
+    healthcheck:
+      # MySQL 전용 헬스체크로 복구
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - shadowfit-net
+
+  shadowfit-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shadowfit-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "6565:6565"
+      # 관리 포트(9090) — **dev 에서만** 호스트에 연다.
+      # docker-compose.prod.yml 에는 이 매핑이 없다. 그게 포트를 분리한 이유 자체다
+      # (외부에 지표를 안 내보낸다, application.yml [6]).
+      # 로컬에서 여는 이유는 verify 스킬이 호스트에서 curl 로 health 를 폴링하기
+      # 때문이다 — 안 열면 로컬 검증 절차가 통째로 막힌다.
+      # 🔴 루프백에 묶는다(#128). 인터페이스를 안 적으면 0.0.0.0 이라 LAN 의 누구나
+      # /actuator/prometheus 를 무인증으로 읽는다 — "보호 수단은 인증이 아니라 포트
+      # 경계"라는 이 설계의 전제가 dev 에서 통째로 깨진다. 용도가 호스트 curl 이므로
+      # 127.0.0.1 로 목적은 그대로다.
+      - "127.0.0.1:9090:9090"
+    # 메모리 한도 — #570. shadowfit-ai(#212)와 같은 이유다: 한도가 없으면 JVM 이 컨테이너가
+    # 아니라 호스트 전체 메모리를 보고 힙을 잡는다(UseContainerSupport 기본값이 켜져 있어도
+    # cgroup 상한이 없으면 볼 게 없다) — MySQL·AI 와 한 호스트에 동거하는 이 프로젝트에서
+    # 그건 옆 컨테이너를 굶기는 쪽으로 간다.
+    #
+    # 값의 근거: 이 dev 박스에서 idle 상태 RSS 실측 651.7MiB(`docker stats`, 2026-08-26). 부하
+    # 중 피크는 미측정이다. AI 와 실패 방향이 다르다는 것도 유의 — AI 는 한도에 걸리면 새 세션을
+    # 거절하고 계속 돈다(우아한 열화)지만, JVM 은 힙이 부족하면 OOMKilled 로 죽는다. 그래서 이
+    # 값은 "빠듯하게 맞춘 값"이 아니라 "옆 컨테이너를 굶기지만 않을 넉넉한 상한"이다.
+    #
+    # ⚠️ 부하 중 실제 피크는 #570 의 열린 항목 — obs 프로파일의 jvm_memory_used_bytes 로 재고
+    # 나서 좁힐 것.
+    mem_limit: ${BACKEND_MEM_LIMIT:-2048m}
+    # CPU 한도 — AI(#212)처럼 포화 지점을 실측해서 고른 값이 아니다. Spring 은 I/O 바운드라
+    # AI 같은 폭주 근거가 아직 없다. 이 값은 "호스트 논리 코어 수를 넘지 않는다"는 구조적
+    # 상한일 뿐 — 실측 전까지는 여기서 더 좁히지 않는다.
+    cpus: ${BACKEND_CPU_LIMIT:-4}
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      TZ: Asia/Seoul
+      # 컨테이너 힙 옵션 — 위 mem_limit 과 짝이다(#570). 75% 는 컨테이너 JVM 의 통상적인
+      # 시작값(논-힙 영역인 스레드 스택·메타스페이스·다이렉트 버퍼에 나머지를 남겨둔다)이고,
+      # 이 프로젝트가 실측해서 고른 값은 아니다 — 실측 후 좁힐 대상이다(#570).
+      JAVA_OPTS: ${BACKEND_JAVA_OPTS:--XX:MaxRAMPercentage=75.0}
+      # 로컬 개발 편의 — Swagger UI/OpenAPI 문서. docker-compose.prod.yml 에는 없어서
+      # 기본값(false)이 그대로 적용된다(application.yml [3]).
+      SPRINGDOC_ENABLED: "true"
+      DB_HOST: shadowfit-mysql
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # 필수 여부는 AI 서비스 쪽 같은 키에 걸어 뒀다 (#430 주석 참고).
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      AI_SERVER_HOST: shadowfit-ai
+      AI_SERVER_GRPC_PORT: 8585
+      # AI 채널 풀 크기 — shadowfit-ai 의 AI_WORKER_COUNT 와 같은 값이어야 한다(ai-channel-pool-hardening.md).
+      # 소스는 여기 하나(${AI_WORKER_COUNT}) 뿐이고, 아래 shadowfit-ai 서비스도 같은 변수를 읽는다.
+      AI_CHANNEL_POOL_SIZE: ${AI_WORKER_COUNT:-3}
+      JWT_SECRET: ${JWT_SECRET:-shadowfit-prod-secret-key-change-this}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # 데드락 재시도 상한 (#276 ②). 기본 5 는 팔당 6판 재측정으로 재확정한 값이다(2026-08-26
+      # 사용자 confirm, r276-ceiling-rank-aws-2026-08-26: 잔여 실패율 3=8.0% > 4=5.9% > 5=2.5%,
+      # 짝비교로 5 가 4 를 6/6·3 을 5/6 에서 이긴다). 코드 기본값(ExerciseGrpcService.deadlockMaxRetries)도
+      # 같은 날 5 로 올라갔다 — 여기가 3 에 남아 있으면 dev 컨테이너만 구값을 쓴다.
+      # 이 줄은 **측정용 손잡이**이기도 하다 — 팔을 바꿔 돌릴 때 재빌드를 안 하려고 둔다.
+      SHADOWFIT_POSE_DEADLOCK_MAX_RETRIES: ${POSE_DEADLOCK_MAX_RETRIES:-5}
+      # 재시도 간격 (#276 ③ 후속). 기본 0 = 즉시 재시도 — 지금까지의 모든 실측이 그 조건이다.
+      # 이것도 측정용 손잡이다: 위쪽 상한이 «더 던지는데 안 벌리는» 이유 후보를 재려면 팔이 필요하다.
+      SHADOWFIT_POSE_DEADLOCK_BACKOFF_MS: ${POSE_DEADLOCK_BACKOFF_MS:-0}
+      SHADOWFIT_POSE_DEADLOCK_BACKOFF_JITTER: ${POSE_DEADLOCK_BACKOFF_JITTER:-false}
+      # HikariCP 풀 크기 — 측정용 손잡이(위 DEADLOCK_* 계열과 같은 패턴). 기본값은
+      # application.yml의 15(commit-count-and-mysql-metrics.md 4차 실측, 대량 INSERT 배치
+      # 워크로드 기준)를 그대로 유지 — 이 env가 없으면 application.yml 값이 그대로 쓰인다.
+      # group-full-user-journey-scenario.md §8-4 원인 분리 실험(풀 크기만 바꿔 재실행)을 위해
+      # 재빌드 없이 값을 바꿀 수 있게 추가했다.
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: ${HIKARI_POOL_SIZE:-15}
+      # §3.3.2 E2E 상호작용 실험 손잡이. 기본 0=off — 콜백에 인위 지연을 얹어 AI worker 가
+      # 얼마나 막히는지 잰다(load-test-strategy.md).
+      POSE_INJECT_DELAY_MS: ${POSE_INJECT_DELAY_MS:-0}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - shadowfit-net
+
+  shadowfit-ai:
+    build:
+      context: ./ai-server
+      dockerfile: Dockerfile
+    container_name: shadowfit-ai
+    restart: unless-stopped
+    # 분기 H2 (프론트 → AI 직결) 채택. HTTP 8000 은 InternalAuthMiddleware
+    # (app/middleware/auth.py) 도입 후 외부 노출 복귀. gRPC 8585 는 Spring 만
+    # 같은 도커 네트워크에서 호출하므로 expose 로 유지 (외부 노출 X).
+    expose:
+      - "8000"
+      - "8001"
+      - "8002"
+      - "8585"
+      - "8586"
+      - "8587"
+    # 메모리 한도 — «검출기를 세션별로 갖는» 구조(#164 ㄴ 안)의 «분모» 다.
+    #
+    # 한도가 없으면 AI 가 세션 수만큼 무한정 커지고, 호스트가 바닥나면 커널 OOM killer 가
+    # «가장 큰» 프로세스를 죽인다 — 보통 MySQL(buffer_pool 2G)이다. 원인과 증상이 다른
+    # 컨테이너에서 나타나 진단이 제일 어려운 형태가 된다. 한도를 걸면 AI 만 죽는다.
+    #
+    # 그리고 이 값이 «동시 세션 상한» 의 근거가 된다. 상한 공식은 x86 EC2 실측 적합
+    # 708MiB + 106.74MiB × 세션(#229·2026-09-02, `docs/decisions/detector-pool-ceiling-formula.md`)
+    # 이므로 여기서 «계산» 할 수 있고, 그래야 코드에 근거 없는 숫자를 안 박는다.
+    #
+    # 기본값이 로컬 기준인 이유: 실패 방향이 안전하다. 작은 기본을 큰 박스에 쓰면 «세션이
+    # 덜 받아짐»(돌긴 한다)이고, 큰 기본을 작은 박스에 쓰면 «안 뜸»이다.
+    #   로컬(물리 2코어) 1536m — 현행 실사용 ~890MB 를 덮는다. CPU 가 ~6세션에서 먼저 막으므로
+    #                            더 줘도 못 쓴다
+    #   EC2 c7i.2xlarge       6656m — 물리 4코어의 CPU 상한 65세션 기준. ⚠️ **미검증 준비값**
+    #                            (배포 대상이 아직 0대다. 옛 공식으로 잡은 한도라 새 공식
+    #                            (708+106.74×65 ≈ 7,646MiB)보다 작다 — 실제로 올릴 때 재확인할 것)
+    mem_limit: ${AI_MEM_LIMIT:-1536m}
+    # CPU 한도 — mem_limit 과 짝을 맞춘다(#212). 한도가 없으면 AI 가 호스트 코어를 전부
+    # 가져가 Spring 요청이 밀리고 MySQL 커밋이 지연되며, obs 스택이 켜져 있으면 지표 자체가
+    # 오염된다(docs/19-deployment.md:234 가 이미 아는 함정). 절대 숫자를 배포 형태 확정 전에
+    # 박지 않는 게 원칙([[feedback_no_arbitrary_threshold_values]])이지만, AI 는 예외다 —
+    # 실측 근거가 있다(c7i.4xlarge, 물리8·논리16코어: 스레드 16 포화, 32 는 처리량 안 늘고
+    # 지연만 2배(28.3→55.1ms), loadtest/results/ai-concurrency-aws-2026-08-14/README.md).
+    # 즉 "AI 상한 = 호스트 논리 코어 수"가 측정에 근거한 값이다.
+    #   로컬(i3-6100, 물리2+HT) 4 — 이 dev 박스의 논리 코어 수 그대로
+    #   EC2 c7i.4xlarge          16 — ⚠️ 미검증 준비값(배포 대상 아직 0대). 실제로 올릴 때
+    #                                재확인할 것 — mem_limit 의 EC2 값과 같은 성격
+    cpus: ${AI_CPU_LIMIT:-4}
+    environment:
+      DEBUG: "false"
+      TZ: Asia/Seoul
+      # 🔴 `:?`(필수)를 건다 (#430). config.py 의 _assert_tokens_separated 가
+      #    *"빈 값은 여기서 막지 않는다 … 운영 필수화는 compose 의 `:?` 가 맡는다"* 라고
+      #    적어두고 있었는데, **정작 이 줄에 그 가드가 없었다.** 설계가 compose 에 위임한
+      #    일을 compose 가 안 하고 있던 셈이다.
+      #    비면 gRPC 서버 스레드가 죽고, 그 상태로 컨테이너는 계속 healthy 였다.
+      #
+      #    🔴 **여기 «#427 과 반대 방향인 것은 의도다 — 거긴 안 켜는 프로파일 서비스이고
+      #    여기는 핵심 서비스다» 라고 적혀 있었는데, 그 구분이 틀렸다** (#489 회귀로 드러났다).
+      #    `profiles` 유무는 축이 아니다 — 진짜 축은 **«이 호출에서 그 서비스를 띄우는가»** 이고,
+      #    프로파일은 그것을 표현하는 한 가지 방법일 뿐이다. `shadowfit-ai` 는 프로파일이 없어도
+      #    **안 띄우는 호출이 있다**: `ROLE=db` 부트스트랩은 MySQL 만 올리는데, compose 는
+      #    **파일 전체를 보간**하므로 여기서 죽었다. 그래서 #427 과 «반대» 가 아니라 **같은 함정**을
+      #    다시 밟은 것이다.
+      #
+      #    ⚠️ 그렇다고 이 `:?` 를 빼지는 않는다 — 비면 gRPC 스레드가 죽는데 컨테이너는 healthy 라
+      #    **조용히 망가지는** 쪽이 더 나쁘다. 대신 **`:?` 를 늘릴 때마다 그 변수를 세우는 모든
+      #    경로(`loadtest/aws/bootstrap.sh` 의 `.env` 블록 포함)가 따라와야 한다**는 것이
+      #    이 줄의 진짜 계약이다. #489 가 그 자리에 `compose config` 게이트를 넣었다.
+      #
+      #    (변수 하나에 `:?` 가 한 번이라도 있으면 전체가 필수가 되므로 74행에는 안 겹쳐 적는다.)
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN 미설정 — AI gRPC 가 안 뜬다 (.env.example 참고)}
+      # 프론트 → AI HTTP 직결 전용. 앱 번들에 배포되는 값이라 위 내부 토큰과 분리한다
+      # (이슈 #134, decisions/ai-auth-token-flow.md ㄱ). 프론트는 같은 값을
+      # EXPO_PUBLIC_AI_PUBLIC_TOKEN 으로 갖는다.
+      AI_PUBLIC_TOKEN: ${AI_PUBLIC_TOKEN}
+      POSE_MODEL_COMPLEXITY: 1
+      # 워커 프로세스 수 — entrypoint.sh 가 이 값으로 몇 개를 띄우고 포트를 어떻게 나눌지 정한다.
+      # 위 shadowfit-backend 의 AI_CHANNEL_POOL_SIZE 와 같은 소스(${AI_WORKER_COUNT})를 쓴다.
+      AI_WORKER_COUNT: ${AI_WORKER_COUNT:-3}
+      # 프레임 경로 계측 노브 — config.py 가 환경변수로 읽는데 여기 없어서 컨테이너로 띄운
+      # AI 는 계측을 켤 수단이 없었다(#399). EC2 배포(bootstrap.sh ROLE=p6-target)가 정확히
+      # 이 compose 로 뜬다. 기본값은 config.py 와 동일하게 전부 꺼진 채로 둔다 — 상시로 두면
+      # 안 되는 계측이라는 게 config.py 의 계약이다. 켜려면 .env 나 셸에서 값만 실어보내면 됨.
+      FRAME_PATH_METRICS: ${FRAME_PATH_METRICS:-false}
+      FRAME_PATH_SAMPLES: ${FRAME_PATH_SAMPLES:-4096}
+      GIL_SWITCH_INTERVAL: ${GIL_SWITCH_INTERVAL:-0}
+      GIL_PROBE_INTERVAL: ${GIL_PROBE_INTERVAL:-0}
+      RESPONSE_MODE: ${RESPONSE_MODE:-model}
+      POSE_NULL_HANDLER: ${POSE_NULL_HANDLER:-false}
+      # POSE_DETECTOR_POOL_SIZE 는 일부러 안 넘긴다 — 기본값 0 이면 config.py 가 cgroup
+      # 메모리 한도에서 상한을 유도한다(mediapipe_detector.py:170-179). 여기서 숫자를
+      # 강제하면 그 자동유도가 죽는다.
+    healthcheck:
+      # AI 서버용 파이썬 방식 헬스체크 적용 (curl 대신)
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s # 서버 기동 대기 시간 추가
+    networks:
+      - shadowfit-net
+
+  # 프론트 → AI 프레임 경로(POST /pose) 세션 고정 라우팅 (2026-08-26).
+  # AI를 워커 3개(별도 포트 8000/8001/8002)로 쪼갠 뒤, 프론트가 고정 주소 하나만 아는
+  # 구조를 유지하려고 앞에 둔다. Spring이 세션 시작 응답으로 알려준 워커 인덱스를
+  # X-AI-Worker 헤더로 실어 보내면, 그대로 해당 포트로 고정 전달한다(nginx-ai/default.conf).
+  ai-nginx:
+    image: nginx:1.27-alpine
+    container_name: shadowfit-ai-nginx
+    restart: unless-stopped
+    depends_on:
+      - shadowfit-ai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx-ai/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - shadowfit-net
+
+  # ── 관측 스택 ─────────────────────────────────────────────────────────────
+  # 기본으로는 뜨지 않는다. 켤 때만:  docker compose --profile obs up -d
+  #
+  # profile 로 뺀 이유는 취향이 아니라 **측정 오염**이다. 이 개발 장비는 2물리코어에
+  # MySQL+백엔드+AI 가 이미 동거 중이라(load-test-strategy.md 전제), 부하 실험 중에
+  # 관측 스택까지 같이 돌면 무엇 때문에 느려졌는지 구분할 수 없게 된다.
+  # 그래프를 보려고 켠 것이 그래프를 못 믿게 만드는 상황을 만들지 않는다.
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: shadowfit-prometheus
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 보존기간 7일. 이 프로젝트의 용도는 장기 추세가 아니라 "실험 한 판 동안의
+      # 과정"이라, 그보다 길게 잡으면 디스크만 먹는다.
+      - --storage.tsdb.retention.time=7d
+    # CPU 상대 우선순위 — 기본값(1024) 대비 낮춘다(#212). 관측 스택이 앱·DB 와 코어를 다투면
+    # 지표 자체가 오염된다(docs/19-deployment.md:234). obs profile 이라 기본으로는 안 뜨지만,
+    # 켰을 때는 이 값이 지켜준다.
+    cpu_shares: 256
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      # 호스트 9091 — 백엔드 관리포트 9090 과 헷갈리지 않게 어긋냈다.
+      # 루프백 고정(#128): 프로메테우스 UI 는 인증이 아예 없어 노출되면 지표 전량이 공개된다.
+      - "127.0.0.1:9091:9090"
+    networks:
+      - shadowfit-net
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: shadowfit-grafana
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      # 로컬 전용이고 외부에 열지 않는다. 운영에 올릴 때는 반드시 바꿀 것.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # 익명 접근 차단 — 기본값이지만 명시한다.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      TZ: Asia/Seoul
+    # CPU 상대 우선순위 — prometheus 와 같은 이유(#212).
+    cpu_shares: 256
+    volumes:
+      # 프로비저닝 — 대시보드를 손으로 만들지 않는다. 손으로 만들면 그 그래프가
+      # 어떻게 나왔는지 코드에 안 남아서, 재현도 리뷰도 안 된다.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    ports:
+      # 루프백 고정(#128). 아래 기본 비밀번호가 admin 이라, 0.0.0.0 이면 .env 가 없는
+      # 순간 admin/admin 콘솔이 LAN 에 열린다.
+      - "127.0.0.1:3000:3000"
+    networks:
+      - shadowfit-net
+
+  # MySQL 내부 지표. 2026-08-09 추가 — **이전에는 «의도적으로 뺐다» 고 적혀 있었다.**
+  #
+  # 뺐던 근거는 두 개였고 둘 다 로컬 단일 박스 전제였다: ① loadtest/ 스크립트가 SHOW STATUS 로
+  # 직접 떠 오니 중복이다 ② 실험 중 컨테이너가 하나 는다. 2026-08-08 분리 배포(EC2 3대)에서
+  # 둘 다 무너졌다 — 원격 자동 스윕에서는 SHOW STATUS 를 **뜨는 사람이 없었고**, 수집된 지표가
+  # 전부 job="shadowfit-backend" 라 MySQL 쪽을 아예 못 봤다. 그 결과 "MySQL 은 놀고 백엔드가
+  # 탄다" 는 **수집한 적 없는 지표에 근거한 문장**이 나왔고 철회됐다.
+  # (docs/decisions/commit-count-and-mysql-metrics.md §3-1)
+  #
+  # ② 는 obs 를 분리한 순간 무의미해졌다 — 이 컨테이너는 피시험 대상(DB·앱)이 아니라
+  # 관측 쪽에 뜬다. 로컬에서도 obs 프로파일 뒤에 있어 기본으로는 안 뜬다.
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.16.0
+    container_name: shadowfit-mysqld-exporter
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --mysqld.address=shadowfit-mysql:3306
+      - --mysqld.username=exporter
+    environment:
+      # 🔴 shadowfit 계정을 재사용하지 않는다. 이 계정에 필요한 권한(PROCESS·REPLICATION
+      # CLIENT·performance_schema SELECT)은 앱 계정이 가지면 안 되는 것이고, 반대로 앱
+      # 계정의 DML 권한은 익스포터가 가질 이유가 없다. 계정 생성은 mysql/apply-exporter-user.sh.
+      #
+      # 🔴 기본값(:-exporter)을 뺐던 이유 (#167): 계정 생성이 별도 파일로 갈려 있어서, 기본값이
+      #    있으면 «compose 는 .env 값, 계정은 옛 값» 인 조합이 조용히 성립한다. 그 결과는
+      #    타깃 DOWN 이고, 그건 MySQL 지표만 통째로 비는 형태라 알아채기 어렵다.
+      #    값을 바꿨으면 apply-exporter-user.sh 를 다시 돌려 계정도 맞출 것.
+      #
+      # 🔴 그런데 `:?`(필수)는 **쓸 수 없다** (#427). compose 는 **활성 프로파일과 무관하게
+      #    파일 전체를 보간**하므로, 안 켜는 이 서비스의 필수 변수가 `docker compose build
+      #    shadowfit-backend` 같은 **무관한 명령까지 전부 죽인다**(v2.40.3 에서 확인).
+      #    실제로 exporter 가 들어오기 전에 만들어진 `.env` 를 쓰던 박스에서 백엔드 빌드가
+      #    막혔고, 그걸 «빌드 성공» 으로 오독해 옛 이미지로 검증을 한 판 돌린 사고가 있었다.
+      #
+      #    ⚠️ **무엇을 내줬는지 분명히 한다**: #167 이 노린 «잊으면 시끄럽게 깨진다» 가
+      #    «obs 를 켰을 때만 깨진다» 로 약해졌다. 안 켠 사람을 막지 않는 대가다.
+      #    값이 비면 아래 센티넬이 들어가 인증에 실패하고 `mysql_up 0` 으로 나타난다 —
+      #    **센티넬 문자열 자체가 원인을 말하도록** 이름을 지었다. 확인:
+      #      docker compose --profile obs exec -T mysqld-exporter       #        wget -qO- localhost:9104/metrics | grep '^mysql_up'
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:-UNSET_SEE_env_example_AND_ISSUE_427}
+      TZ: Asia/Seoul
+    # CPU 상대 우선순위 — prometheus 와 같은 이유(#212).
+    cpu_shares: 256
+    depends_on:
+      - mysql
+    # 포트를 호스트에 열지 않는다. Prometheus 가 같은 도커 네트워크에서 9104 를 긁는다 —
+    # 백엔드 관리 포트(9090)를 안 여는 것과 같은 이유다(application.yml [6]).
+    networks:
+      - shadowfit-net
+
+  # 컨테이너별 CPU·메모리 시계열. 2026-08-28 추가 — AI 워커 부하-중 장애 라운드
+  # (docs/decisions/ai-worker-load-soak-experiment.md)에서 MySQL 컨테이너가 죽기 직전 메모리가
+  # 어떻게 올라갔는지 `docker stats` 수동 스냅샷으로만 사후 재구성해야 했던 갭을 메운다 —
+  # 이게 있었으면 Grafana 에서 실시간으로 봤을 것을 SSH 붙어 로그를 뒤져야 했다.
+  #
+  # cgroup v2 전제(이 저장소가 개발·EC2 양쪽에서 실제로 도는 조건, 2026-08-28 `cgroup.controllers`
+  # 로 확인) — v0.49+ 가 v2 를 안정적으로 지원한다. `/sys`·`/var/lib/docker` 를 읽기 전용으로
+  # 마운트해서 컨테이너별 cgroup 지표를 직접 읽는다(docker.sock 은 필요 없다).
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: shadowfit-cadvisor
+    profiles: ["obs"]
+    restart: unless-stopped
+    # CPU 상대 우선순위 — 나머지 obs 컨테이너와 같은 이유(#212).
+    cpu_shares: 256
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      # 백엔드(8080)와 안 겹치게 호스트 쪽만 8085 로 어긋낸다. 루프백 고정(#128) — cAdvisor UI 도
+      # 인증이 없다.
+      - "127.0.0.1:8085:8080"
+    networks:
+      - shadowfit-net
+
+  # 호스트 레벨 지표(전체 메모리·스왑·**커널 OOM killer 이벤트**). 2026-08-28 추가 — 같은 라운드가
+  # systemd 저널이 사고 도중 멈춰서 OOM killer 로그 자체를 사후에 못 찾는 상황을 겪었다. 이
+  # 익스포터가 살아있는 동안 Prometheus 가 긁어가면, 저널이 나중에 죽어도 그 전까지의 시계열은
+  # 남는다.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: shadowfit-node-exporter
+    profiles: ["obs"]
+    restart: unless-stopped
+    cpu_shares: 256
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      # 컨테이너 안에서 도커 자체의 오버레이 파일시스템까지 훑으면 노이즈만 늘고, 알고 싶은 건
+      # 호스트 실제 디스크다.
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    ports:
+      - "127.0.0.1:9100:9100"
+    networks:
+      - shadowfit-net
+
+networks:
+  shadowfit-net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
